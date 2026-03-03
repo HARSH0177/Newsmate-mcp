@@ -1,311 +1,118 @@
-/**
- * ╔════════════════════════════════════════════════════════╗
- * ║   NewsMate MCP Web Search Server  v1.0                ║
- * ║   Provides web search to the NewsMate AI agent        ║
- * ╚════════════════════════════════════════════════════════╝
- *
- * Setup:
- *   npm install express cors helmet dotenv axios
- *   node mcp-server.js
- *
- * Required .env:
- *   NEWS_API_KEY=your_key      # https://newsapi.org (free: 100 req/day)
- *   GNEWS_API_KEY=your_key     # https://gnews.io   (free: 100 req/day)
- *   NEWSDATA_API_KEY=your_key  # https://newsdata.io (free: 200 req/day)
- *   PORT=3000
- *   ALLOWED_ORIGINS=http://localhost:8080,http://127.0.0.1:5500
- */
-
-import express from 'express';
-import cors    from 'cors';
-import helmet  from 'helmet';
-import dotenv  from 'dotenv';
-import axios   from 'axios';
-
-dotenv.config();
+const express = require('express');
+const https   = require('https');
+const http    = require('http');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Middleware ───────────────────────────────────────────
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS
-    ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-    : '*',
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type']
-}));
-app.use(express.json({ limit: '10kb' }));
-
-// ─── Authorized news sources ─────────────────────────────
-const AUTHORIZED_SOURCES = [
-  { name: 'CNN',             domain: 'cnn.com' },
-  { name: 'BBC',             domain: 'bbc.com' },
-  { name: 'Reuters',         domain: 'reuters.com' },
-  { name: 'India Today',     domain: 'indiatoday.in' },
-  { name: 'The Guardian',    domain: 'theguardian.com' },
-  { name: 'AP News',         domain: 'apnews.com' },
-  { name: 'Al Jazeera',      domain: 'aljazeera.com' },
-  { name: 'The Hindu',       domain: 'thehindu.com' },
-  { name: 'NDTV',            domain: 'ndtv.com' },
-  { name: 'Times of India',  domain: 'timesofindia.indiatimes.com' },
-  { name: 'NPR',             domain: 'npr.org' },
-  { name: 'NY Times',        domain: 'nytimes.com' },
-  { name: 'Washington Post', domain: 'washingtonpost.com' },
-  { name: 'Bloomberg',       domain: 'bloomberg.com' },
-  { name: 'The Economist',   domain: 'economist.com' },
-  { name: 'Forbes',          domain: 'forbes.com' },
-  { name: 'Financial Times', domain: 'ft.com' },
-  { name: 'ABC News',        domain: 'abcnews.go.com' },
-  { name: 'CBS News',        domain: 'cbsnews.com' }
-];
-
-function isAuthorized(url) {
-  if (!url) return false;
-  return AUTHORIZED_SOURCES.some(s => url.includes(s.domain));
-}
-
-function getSourceName(url) {
-  const match = AUTHORIZED_SOURCES.find(s => url.includes(s.domain));
-  return match?.name || 'Unknown';
-}
-
-// ─── Request logger ──────────────────────────────────────
-app.use((req, _res, next) => {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}] ${req.method} ${req.path}`);
+// CORS — manual headers on every response
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
+app.use(express.json());
 
-// ─────────────────────────────────────────────────────────
-// SEARCH PROVIDERS
-// ─────────────────────────────────────────────────────────
+const SOURCES = {
+  'cnn.com':'CNN','bbc.com':'BBC','reuters.com':'Reuters',
+  'indiatoday.in':'India Today','theguardian.com':'The Guardian',
+  'apnews.com':'AP News','aljazeera.com':'Al Jazeera',
+  'thehindu.com':'The Hindu','ndtv.com':'NDTV',
+  'timesofindia.indiatimes.com':'Times of India','npr.org':'NPR',
+  'nytimes.com':'NY Times','washingtonpost.com':'Washington Post',
+  'bloomberg.com':'Bloomberg','economist.com':'The Economist',
+  'forbes.com':'Forbes','ft.com':'Financial Times',
+  'abcnews.go.com':'ABC News','cbsnews.com':'CBS News'
+};
+const DOMAINS = Object.keys(SOURCES);
 
-/** NewsAPI.org */
-async function fromNewsAPI(query, max) {
-  if (!process.env.NEWS_API_KEY) return [];
-  try {
-    const { data } = await axios.get('https://newsapi.org/v2/everything', {
-      params: {
-        q: query,
-        apiKey: process.env.NEWS_API_KEY,
-        pageSize: Math.min(max, 20),
-        language: 'en',
-        sortBy: 'relevancy'
-      },
-      timeout: 8000
+function isAuth(url) { return url && DOMAINS.some(d => url.includes(d)); }
+function srcName(url){ const d = DOMAINS.find(d => url && url.includes(d)); return d ? SOURCES[d] : 'Unknown'; }
+
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, { headers:{'User-Agent':'NewsMate/2.0'} }, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(body) }); }
+        catch(e) { reject(new Error('JSON parse failed')); }
+      });
     });
-
-    return (data.articles || [])
-      .filter(a => isAuthorized(a.url))
-      .map(a => ({
-        title:       a.title,
-        description: a.description,
-        content:     a.content,
-        url:         a.url,
-        source:      a.source?.name || getSourceName(a.url),
-        publishedAt: a.publishedAt,
-        author:      a.author,
-        provider:    'newsapi'
-      }));
-  } catch (err) {
-    console.error('[NewsAPI]', err.message);
-    return [];
-  }
+    req.setTimeout(9000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.on('error', e => reject(new Error(e.message)));
+  });
 }
 
-/** GNews.io */
-async function fromGNews(query, max) {
-  if (!process.env.GNEWS_API_KEY) return [];
+async function fromNewsAPI(q, max) {
+  const key = process.env.NEWS_API_KEY;
+  if (!key) return [];
   try {
-    const { data } = await axios.get('https://gnews.io/api/v4/search', {
-      params: {
-        q: query,
-        token: process.env.GNEWS_API_KEY,
-        lang: 'en',
-        max: Math.min(max, 10)
-      },
-      timeout: 8000
-    });
-
-    return (data.articles || [])
-      .filter(a => isAuthorized(a.url))
-      .map(a => ({
-        title:       a.title,
-        description: a.description,
-        content:     a.content,
-        url:         a.url,
-        source:      a.source?.name || getSourceName(a.url),
-        publishedAt: a.publishedAt,
-        provider:    'gnews'
-      }));
-  } catch (err) {
-    console.error('[GNews]', err.message);
-    return [];
-  }
+    const {status, data} = await httpGet(`https://newsapi.org/v2/everything?q=${encodeURIComponent(q)}&apiKey=${key}&pageSize=${max}&language=en&sortBy=relevancy`);
+    if (status !== 200 || !data.articles) return [];
+    return data.articles.filter(a => isAuth(a.url)).map(a => ({
+      title: a.title||'', description: a.description||'', url: a.url,
+      source: a.source?.name || srcName(a.url), provider:'newsapi'
+    }));
+  } catch(e) { console.error('[NewsAPI]', e.message); return []; }
 }
 
-/** NewsData.io */
-async function fromNewsData(query, max) {
-  if (!process.env.NEWSDATA_API_KEY) return [];
+async function fromGNews(q, max) {
+  const key = process.env.GNEWS_API_KEY;
+  if (!key) return [];
   try {
-    const { data } = await axios.get('https://newsdata.io/api/1/news', {
-      params: {
-        q: query,
-        apikey: process.env.NEWSDATA_API_KEY,
-        language: 'en',
-        size: Math.min(max, 10)
-      },
-      timeout: 8000
-    });
-
-    return (data.results || [])
-      .filter(a => isAuthorized(a.link))
-      .map(a => ({
-        title:       a.title,
-        description: a.description,
-        content:     a.content,
-        url:         a.link,
-        source:      a.source_id || getSourceName(a.link),
-        publishedAt: a.pubDate,
-        provider:    'newsdata'
-      }));
-  } catch (err) {
-    console.error('[NewsData]', err.message);
-    return [];
-  }
+    const {status, data} = await httpGet(`https://gnews.io/api/v4/search?q=${encodeURIComponent(q)}&token=${key}&lang=en&max=${max}`);
+    if (status !== 200 || !data.articles) return [];
+    return data.articles.filter(a => isAuth(a.url)).map(a => ({
+      title: a.title||'', description: a.description||'', url: a.url,
+      source: a.source?.name || srcName(a.url), provider:'gnews'
+    }));
+  } catch(e) { console.error('[GNews]', e.message); return []; }
 }
 
-/** Merge + deduplicate results across providers */
-async function searchAllProviders(query, maxResults) {
-  // Run all providers in parallel
-  const [newsapi, gnews, newsdata] = await Promise.all([
-    fromNewsAPI(query, maxResults),
-    fromGNews(query, maxResults),
-    fromNewsData(query, maxResults)
-  ]);
-
-  const combined = [...newsapi, ...gnews, ...newsdata];
-  const seen = new Set();
-  const unique = [];
-
-  for (const article of combined) {
-    if (!article.url || seen.has(article.url)) continue;
-    seen.add(article.url);
-    unique.push(article);
-  }
-
-  return unique.slice(0, maxResults);
+async function searchAll(q, max) {
+  const [a,b] = await Promise.all([fromNewsAPI(q,max), fromGNews(q,max)]);
+  const seen=new Set(), out=[];
+  for (const x of [...a,...b]) { if(!x.url||seen.has(x.url)) continue; seen.add(x.url); out.push(x); }
+  return out;
 }
 
-// ─────────────────────────────────────────────────────────
-// MCP ENDPOINTS
-// ─────────────────────────────────────────────────────────
+app.use((req,_,next) => { console.log(`${new Date().toISOString()} ${req.method} ${req.path}`); next(); });
 
-/**
- * POST /mcp/search
- * Body: { query: string, maxResults?: number, queries?: string[] }
- * 
- * If `queries` array is provided, searches all of them and merges results.
- * This is used by the NewsMate Orchestrator Agent which generates 3 queries.
- */
+app.get('/', (_,res) => res.json({ name:'NewsMate MCP v2', status:'running',
+  newsapi: !!process.env.NEWS_API_KEY, gnews: !!process.env.GNEWS_API_KEY }));
+
+app.get('/health', (_,res) => res.json({ status:'ok', cors:'enabled',
+  newsapi: !!process.env.NEWS_API_KEY, gnews: !!process.env.GNEWS_API_KEY,
+  time: new Date().toISOString() }));
+
 app.post('/mcp/search', async (req, res) => {
-  const { query, queries, maxResults = 10 } = req.body;
-
-  if (!query && (!queries || queries.length === 0)) {
-    return res.status(400).json({ success: false, error: 'query or queries field required' });
-  }
-
-  const searchTerms = queries?.length > 0 ? queries : [query];
-
+  const {query, queries, maxResults=8} = req.body||{};
+  if (!query && !(Array.isArray(queries)&&queries.length))
+    return res.status(400).json({success:false, error:'Provide query or queries'});
+  const terms = (Array.isArray(queries)&&queries.length) ? queries.slice(0,3) : [query];
   try {
-    let allResults = [];
-    for (const q of searchTerms.slice(0, 3)) {
-      const results = await searchAllProviders(q, maxResults);
-      allResults.push(...results);
-    }
-
-    // Deduplicate across multi-query
-    const seen = new Set();
-    const finalResults = [];
-    for (const a of allResults) {
-      if (!a.url || seen.has(a.url)) continue;
-      seen.add(a.url); finalResults.push(a);
-    }
-
-    res.json({
-      success:      true,
-      query:        searchTerms[0],
-      queries:      searchTerms,
-      resultsCount: finalResults.length,
-      results:      finalResults.slice(0, maxResults),
-      timestamp:    new Date().toISOString()
-    });
-
-  } catch (err) {
-    console.error('[/mcp/search]', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
+    const all=[];
+    for (const q of terms) all.push(...await searchAll(q, maxResults));
+    const seen=new Set(), final=[];
+    for (const a of all) { if(!a.url||seen.has(a.url)) continue; seen.add(a.url); final.push(a); }
+    res.json({success:true, queries:terms, count:final.length, results:final.slice(0,maxResults)});
+  } catch(e) { res.status(500).json({success:false, error:e.message}); }
 });
 
-/** GET /health — health check */
-app.get('/health', (_req, res) => {
-  res.json({
-    status:    'healthy',
-    version:   '1.0.0',
-    timestamp: new Date().toISOString(),
-    providers: {
-      newsapi:  !!process.env.NEWS_API_KEY,
-      gnews:    !!process.env.GNEWS_API_KEY,
-      newsdata: !!process.env.NEWSDATA_API_KEY
-    },
-    authorizedSources: AUTHORIZED_SOURCES.length
-  });
+app.get('/mcp/search', async (req, res) => {
+  const results = await searchAll(req.query.q||'news', 5);
+  res.json({success:true, count:results.length, results});
 });
 
-/** GET /mcp/info — MCP capability manifest */
-app.get('/mcp/info', (_req, res) => {
-  res.json({
-    name:     'NewsMate MCP Web Search Server',
-    version:  '1.0.0',
-    protocol: 'MCP',
-    tools: [
-      {
-        name:        'search',
-        description: 'Search authorized news sources for articles relevant to a query or claim',
-        endpoint:    'POST /mcp/search',
-        parameters: {
-          query:      'string (required if queries not set) — single search term',
-          queries:    'string[] (optional) — multiple queries, results merged',
-          maxResults: 'number (optional, default 10) — max articles to return'
-        },
-        returns: 'Array of { title, description, content, url, source, publishedAt, provider }'
-      }
-    ],
-    authorizedSources: AUTHORIZED_SOURCES
-  });
-});
+app.use((req,res) => res.status(404).json({error:'Not found'}));
 
-/** 404 handler */
-app.use((_req, res) => {
-  res.status(404).json({ error: 'Endpoint not found. See GET /mcp/info' });
-});
-
-// ─── Start ────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('\n╔══════════════════════════════════════╗');
-  console.log('║  NewsMate MCP Server  v1.0            ║');
-  console.log(`╚══════════════════════════════════════╝`);
-  console.log(`\n  🌐 Running at http://localhost:${PORT}`);
-  console.log(`  📡 Health:   http://localhost:${PORT}/health`);
-  console.log(`  🔍 Search:   POST http://localhost:${PORT}/mcp/search`);
-  console.log(`  📋 Info:     http://localhost:${PORT}/mcp/info`);
-  console.log('\n  Active providers:');
-  console.log(`    NewsAPI:   ${process.env.NEWS_API_KEY  ? '✓' : '✗ (set NEWS_API_KEY)'}`);
-  console.log(`    GNews:     ${process.env.GNEWS_API_KEY ? '✓' : '✗ (set GNEWS_API_KEY)'}`);
-  console.log(`    NewsData:  ${process.env.NEWSDATA_API_KEY ? '✓' : '✗ (set NEWSDATA_API_KEY)'}`);
-  console.log('\n');
+  console.log(`\n✅ NewsMate MCP v2.0 on port ${PORT}`);
+  console.log(`   NewsAPI: ${process.env.NEWS_API_KEY?'✅':'❌ set NEWS_API_KEY'}`);
+  console.log(`   GNews:   ${process.env.GNEWS_API_KEY?'✅':'❌ set GNEWS_API_KEY'}\n`);
 });
 
-export default app;
